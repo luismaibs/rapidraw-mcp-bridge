@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  server:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+      - name: Unit tests (bridge scheduling, planner, reports)
+        working-directory: server
+        run: cargo test --locked
+      - name: Build the server
+        working-directory: server
+        run: cargo build --locked
+      - name: MCP handshake and tool list
+        working-directory: tests
+        run: python smoke.py
+        env:
+          RAPIDRAW_MCP_EXE: ${{ github.workspace }}\server\target\debug\rapidraw-mcp.exe

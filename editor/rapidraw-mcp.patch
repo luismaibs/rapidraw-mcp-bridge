@@ -1,0 +1,312 @@
+diff --git a/src-tauri/src/app_settings.rs b/src-tauri/src/app_settings.rs
+index 9c88d3e..52a2d78 100644
+--- a/src-tauri/src/app_settings.rs
++++ b/src-tauri/src/app_settings.rs
+@@ -915,7 +915,7 @@ pub fn save_settings(settings: AppSettings, app_handle: AppHandle) -> Result<(),
+     crate::immich::apply_settings(&settings.immich);
+ 
+     let state = app_handle.state::<AppState>();
+-    let cache_size = settings.image_cache_size.unwrap_or(5) as usize;
++    let cache_size = crate::mcp_bridge::decoded_cache_cap(settings.image_cache_size.unwrap_or(5) as usize);
+     state
+         .decoded_image_cache
+         .lock()
+diff --git a/src-tauri/src/file_management.rs b/src-tauri/src/file_management.rs
+index 723543b..7e5fae8 100644
+--- a/src-tauri/src/file_management.rs
++++ b/src-tauri/src/file_management.rs
+@@ -3231,12 +3231,12 @@ fn update_metadata_for_paths(
+     paths: &[String],
+     app_handle: &AppHandle,
+     update: impl Fn(&mut ImageMetadata) + Sync,
+-) {
++) -> Result<(), String> {
+     let settings = load_settings(app_handle.clone()).unwrap_or_default();
+     let enable_xmp_sync = settings.enable_xmp_sync.unwrap_or(false);
+     let create_xmp_if_missing = settings.create_xmp_if_missing.unwrap_or(false);
+ 
+-    paths.par_iter().for_each(|path| {
++    let failures: Vec<String> = paths.par_iter().filter_map(|path| {
+         let (source_path, sidecar_path) = parse_virtual_path(path);
+ 
+         match crate::exif_processing::update_sidecar(&sidecar_path, &source_path, &update) {
+@@ -3244,9 +3244,11 @@ fn update_metadata_for_paths(
+                 sync_metadata_to_xmp(&source_path, &metadata, create_xmp_if_missing);
+             }
+             Ok(_) => {}
+-            Err(e) => log::error!("Failed to update sidecar for {}: {}", path, e),
++            Err(e) => return Some(format!("Failed to update sidecar for {}: {}", path, e)),
+         }
+-    });
++        None
++    }).collect();
++    if failures.is_empty() { Ok(()) } else { Err(failures.join("\n")) }
+ }
+ 
+ #[tauri::command]
+@@ -3268,9 +3270,7 @@ pub fn set_color_label_for_paths(
+         if !tags.is_empty() {
+             metadata.tags = Some(tags);
+         }
+-    });
+-
+-    Ok(())
++    })
+ }
+ 
+ #[tauri::command]
+@@ -3284,9 +3284,7 @@ pub fn set_rating_for_paths(
+         if rating > 0 && metadata.flag == Some(ImageFlag::Reject) {
+             metadata.flag = None;
+         }
+-    });
+-
+-    Ok(())
++    })
+ }
+ 
+ #[tauri::command]
+@@ -3297,9 +3295,7 @@ pub fn set_flag_for_paths(
+ ) -> Result<(), String> {
+     update_metadata_for_paths(&paths, &app_handle, |metadata| {
+         metadata.flag = flag;
+-    });
+-
+-    Ok(())
++    })
+ }
+ 
+ #[tauri::command]
+diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
+index 7983026..c170b46 100644
+--- a/src-tauri/src/lib.rs
++++ b/src-tauri/src/lib.rs
+@@ -57,6 +57,7 @@ mod lens_blur;
+ mod lens_correction;
+ mod lut_processing;
+ mod mask_generation;
++mod mcp_bridge;
+ mod memory_budget;
+ mod multi_exposure;
+ mod negative_conversion;
+@@ -1716,6 +1717,7 @@ async fn save_collage(base64_data: String, first_path_str: String) -> Result<Str
+ #[tauri::command]
+ async fn generate_preview_for_path(
+     path: String,
++    max_dimension: Option<u32>,
+     js_adjustments: Value,
+     app_handle: tauri::AppHandle,
+ ) -> Result<Response, String> {
+@@ -1733,7 +1735,27 @@ async fn generate_preview_for_path(
+             .map_err(|e| e.to_string())?;
+         let (transformed_image, unscaled_crop_offset) =
+             apply_all_transformations(Cow::Borrowed(base_image.as_ref()), &js_adjustments);
+-        let (img_w, img_h) = transformed_image.dimensions();
++        // A preview asked at a size is rendered at that size. Rendering the whole frame and shrinking it
++        // afterwards costs hundreds of MB of GPU memory per 24 MP photo and can exhaust it.
++        let (full_w, full_h) = transformed_image.dimensions();
++        let target = max_dimension.filter(|n| *n >= 200 && full_w.max(full_h) > *n);
++        let (render_image, scale, crop_offset) = match target {
++            Some(n) => {
++                let small = crate::image_processing::downscale_f32_image(transformed_image.as_ref(), n, n);
++                let s = small.width() as f32 / full_w as f32;
++                (
++                    Cow::Owned(small),
++                    s,
++                    (unscaled_crop_offset.0 * s, unscaled_crop_offset.1 * s),
++                )
++            }
++            None => (
++                Cow::Borrowed(transformed_image.as_ref()),
++                1.0,
++                unscaled_crop_offset,
++            ),
++        };
++        let (img_w, img_h) = render_image.dimensions();
+         let mask_definitions: Vec<MaskDefinition> = js_adjustments
+             .get("masks")
+             .and_then(|m| serde_json::from_value(m.clone()).ok())
+@@ -1748,8 +1770,8 @@ async fn generate_preview_for_path(
+                     def,
+                     img_w,
+                     img_h,
+-                    1.0,
+-                    unscaled_crop_offset,
++                    scale,
++                    crop_offset,
+                     warped_image.as_deref(),
+                 )
+             })
+@@ -1770,7 +1792,7 @@ async fn generate_preview_for_path(
+         let final_image = process_and_get_dynamic_image(
+             &context,
+             &state,
+-            transformed_image.as_ref(),
++            render_image.as_ref(),
+             unique_hash,
+             RenderRequest {
+                 adjustments: all_adjustments,
+@@ -1782,6 +1804,10 @@ async fn generate_preview_for_path(
+             "generate_preview_for_path",
+         )?;
+ 
++        let final_image = match max_dimension {
++            Some(n) if n > 0 && final_image.width().max(final_image.height()) > n => final_image.thumbnail(n,n),
++            _ => final_image,
++        };
+         let (width, height) = final_image.dimensions();
+         let rgb_pixels = final_image.to_rgb8().into_vec();
+ 
+@@ -1811,6 +1837,11 @@ fn setup_logging(app_handle: &tauri::AppHandle) {
+ 
+     let log_file_path = log_dir.join("app.log");
+ 
++    // Keep the previous run's log: after a crash it is the only record of what happened.
++    if fs::metadata(&log_file_path).is_ok_and(|m| m.len() > 0) {
++        let _ = fs::rename(&log_file_path, log_dir.join("app.previous.log"));
++    }
++
+     let log_file = fs::OpenOptions::new()
+         .write(true)
+         .create(true)
+@@ -2116,6 +2147,8 @@ pub fn run() {
+                     }
+         })
+         .setup(move |app| {
++            #[cfg(windows)]
++            mcp_bridge::start(app.handle().clone());
+             #[cfg(feature = "tethering")]
+             {
+                 std::thread::spawn(|| {
+@@ -2537,6 +2570,10 @@ pub fn run() {
+             apply_adjustments,
+             subscribe_analytics,
+             generate_preview_for_path,
++            mcp_bridge::mcp_reply,
++            mcp_bridge::mcp_ready,
++            mcp_bridge::mcp_log,
++            mcp_bridge::mcp_progress,
+             generate_preset_preview,
+             generate_uncropped_preview,
+             get_log_file_path,
+diff --git a/src/App.tsx b/src/App.tsx
+index 07b2abb..fb1d869 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -51,6 +51,7 @@ import { useTauriListeners } from './hooks/useTauriListeners';
+ import { transferFiles, useFileOperations } from './hooks/useFileOperations';
+ import { useAppContextMenus } from './hooks/useAppContextMenus';
+ import { useSortedLibrary } from './hooks/useSortedLibrary';
++import { useMcpBridge } from './hooks/useMcpBridge';
+ import { useAppNavigation } from './hooks/useAppNavigation';
+ import { useExternalEditSession } from './hooks/useExternalEditSession';
+ import ExternalEditBar from './components/ui/ExternalEditBar';
+@@ -431,6 +432,16 @@ function App() {
+     sortedImageList,
+   );
+ 
++  useMcpBridge({
++    handleImageSelect,
++    handleSelectSubfolder,
++    executeDelete,
++    handleCopyAdjustments,
++    handlePasteAdjustments,
++    handleResetAdjustments,
++    handleZoomChange,
++  });
++
+   const {
+     handleStartPanorama,
+     handleSavePanorama,
+diff --git a/src/hooks/useAiMasking.ts b/src/hooks/useAiMasking.ts
+index 13fcd70..4a0cacd 100644
+--- a/src/hooks/useAiMasking.ts
++++ b/src/hooks/useAiMasking.ts
+@@ -9,7 +9,7 @@ import { Adjustments, AiPatch, MaskContainer, Coord } from '../utils/adjustments
+ import { SubMask } from '../components/panel/right/Masks';
+ import { Invokes } from '../components/ui/AppProperties';
+ 
+-const getTransformAdjustments = (adj: Adjustments) => ({
++export const getTransformAdjustments = (adj: Adjustments) => ({
+   transformDistortion: adj.transformDistortion,
+   transformVertical: adj.transformVertical,
+   transformHorizontal: adj.transformHorizontal,
+@@ -29,6 +29,10 @@ const getTransformAdjustments = (adj: Adjustments) => ({
+   lensVignetteEnabled: adj.lensVignetteEnabled,
+ });
+ 
++// Why the last segmentation of a sub-mask failed or came back empty. The toast is gone in seconds;
++// the MCP bridge reads this to tell an agent the real cause instead of "no mask produced".
++export const aiFailures = new Map<string, string>();
++
+ export function useAiMasking() {
+   const { setAdjustments } = useEditorActions();
+   const setEditor = useEditorStore((state) => state.setEditor);
+@@ -354,6 +358,7 @@ export function useAiMasking() {
+       updateSubMask(subMaskId, { parameters: mergedParameters });
+     } catch (error) {
+       if (!String(error).includes('cancelled')) {
++        aiFailures.set(subMaskId, `error: ${error}`);
+         toast.error(`AI Mask Failed: ${error}`);
+       }
+     } finally {
+@@ -422,9 +427,13 @@ export function useAiMasking() {
+       const mergedParameters = { ...(subMask?.parameters || {}), ...newParameters };
+       patchesSentToBackend.delete(subMaskId);
+       updateSubMask(subMaskId, { parameters: mergedParameters });
+-      if (noResult) toast.error(`AI Foreground Mask Failed: ${noResult}`);
++      if (noResult) {
++        aiFailures.set(subMaskId, `no result: ${noResult}`);
++        toast.error(`AI Foreground Mask Failed: ${noResult}`);
++      }
+     } catch (error) {
+       if (!String(error).includes('cancelled')) {
++        aiFailures.set(subMaskId, `error: ${error}`);
+         toast.error(`AI Foreground Mask Failed: ${error}`);
+       }
+     } finally {
+@@ -456,9 +465,13 @@ export function useAiMasking() {
+       const mergedParameters = { ...(subMask?.parameters || {}), ...newParameters };
+       patchesSentToBackend.delete(subMaskId);
+       updateSubMask(subMaskId, { parameters: mergedParameters });
+-      if (noResult) toast.error(`AI Sky Mask Failed: ${noResult}`);
++      if (noResult) {
++        aiFailures.set(subMaskId, `no result: ${noResult}`);
++        toast.error(`AI Sky Mask Failed: ${noResult}`);
++      }
+     } catch (error) {
+       if (!String(error).includes('cancelled')) {
++        aiFailures.set(subMaskId, `error: ${error}`);
+         toast.error(`AI Sky Mask Failed: ${error}`);
+       }
+     } finally {
+@@ -491,9 +504,13 @@ export function useAiMasking() {
+       const mergedParameters = { ...(subMask?.parameters || {}), ...newParameters };
+       patchesSentToBackend.delete(subMaskId);
+       updateSubMask(subMaskId, { parameters: mergedParameters });
+-      if (noResult) toast.error(`AI Text Mask Failed: ${noResult}`);
++      if (noResult) {
++        aiFailures.set(subMaskId, `no result: ${noResult}`);
++        toast.error(`AI Text Mask Failed: ${noResult}`);
++      }
+     } catch (error) {
+       if (!String(error).includes('cancelled')) {
++        aiFailures.set(subMaskId, `error: ${error}`);
+         toast.error(`AI Text Mask Failed: ${error}`);
+       }
+     } finally {
+@@ -528,9 +545,13 @@ export function useAiMasking() {
+       const mergedParameters = { ...subMask.parameters, ...newParameters };
+       patchesSentToBackend.delete(subMaskId);
+       updateSubMask(subMaskId, { parameters: mergedParameters });
+-      if (noResult) toast.error(`AI Face Mask Failed: ${noResult}`);
++      if (noResult) {
++        aiFailures.set(subMaskId, `no result: ${noResult}`);
++        toast.error(`AI Face Mask Failed: ${noResult}`);
++      }
+     } catch (error) {
+       if (!String(error).includes('cancelled')) {
++        aiFailures.set(subMaskId, `error: ${error}`);
+         toast.error(`AI Face Mask Failed: ${error}`);
+       }
+     } finally {
